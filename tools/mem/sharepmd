@@ -1,0 +1,102 @@
+#!/usr/bin/python
+# @lint-avoid-python-3-compatibility-imports
+
+from __future__ import print_function
+from bcc import BPF
+import argparse
+import platform
+from datetime import datetime, timedelta
+
+# define BPF program
+prog = """
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+
+#define FLENGTH 30
+
+struct val_t {
+    u64 ts;
+    u32 pid;
+    unsigned long pud;
+    int type;
+    void *mm;
+    u64 addr;
+    unsigned long sz;
+    char name[TASK_COMM_LEN];
+    char fname[FLENGTH];
+};
+
+BPF_PERF_OUTPUT(events);
+
+enum {
+   HUGEPTE,
+   HUGEPMD,
+};
+
+int trace_hugepte(struct pt_regs *ctx, struct mm_struct *mm, unsigned long address, unsigned long sz)
+{
+    struct val_t val = {};
+    u64 ts;
+
+    if (bpf_get_current_comm(&val.name, sizeof(val.name)) == 0) {
+        val.pid = bpf_get_current_pid_tgid() >> 32;
+        val.ts = bpf_ktime_get_ns();
+        val.mm = mm;
+        val.addr = address;
+        val.sz = sz;
+        val.type = HUGEPTE;
+
+        events.perf_submit(ctx, &val, sizeof(val));
+    }
+    return 0;
+}
+
+int trace_hugepmd(struct pt_regs *ctx, struct mm_struct *mm, unsigned long address, unsigned long pud)
+{
+    struct val_t val = {};
+    u64 ts;
+
+    if (bpf_get_current_comm(&val.name, sizeof(val.name)) == 0) {
+        val.pid = bpf_get_current_pid_tgid() >> 32;
+        val.ts = bpf_ktime_get_ns();
+        val.mm = mm;
+        val.addr = address;
+        val.pud = pud;
+        val.type = HUGEPMD;
+
+        events.perf_submit(ctx, &val, sizeof(val));
+    }
+    return 0;
+}
+"""
+
+b = BPF(text=prog)
+
+print("kernel function: %s" % b.ksym(0xffffffff81449910))
+#b.attach_kprobe(event="huge_pte_alloc", fn_name="trace_hugepte")
+b.attach_kprobe(event="0xffffffff8129c690", fn_name="trace_hugepmd")
+
+HUGEPTE = 0
+HUGEPMD = 1
+
+def sys_name(sys):
+    switcher = {
+        HUGEPTE: "HUGEPTE",
+        HUGEPMD: "HUGEPMD",
+    }
+    return switcher.get(sys, "N/A")
+
+def print_event(cpu, data, size):
+    event = b["events"].event(data)
+
+    print("%3d %-11.9f %-6s %-7s %-8lx %lx %8d %16lx %-6s" % (
+        cpu, float(event.ts) / 1000000000, event.pid,
+        event.name.decode('utf-8', 'replace'), event.addr, event.mm, event.sz, event.pud, sys_name(event.type)), end="\n")
+
+# loop with callback to print_event
+b["events"].open_perf_buffer(print_event, page_cnt=64)
+while 1:
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()
